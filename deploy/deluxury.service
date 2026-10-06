@@ -1,0 +1,16 @@
+[Unit]
+Description=DE LUXURY Telegram Bot & AI Analytics Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/deluxury-bot
+ExecStart=/var/www/deluxury-bot/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
