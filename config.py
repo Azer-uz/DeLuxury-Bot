@@ -19,8 +19,8 @@ def parse_id_list(env_val: str):
             res.add(int(item))
     return res
 
-SUPER_ADMIN_IDS = parse_id_list(os.getenv("SUPER_ADMIN_IDS", "1223243487"))
-MANAGER_IDS = parse_id_list(os.getenv("MANAGER_IDS", ""))
+SUPER_ADMIN_IDS = parse_id_list(os.getenv("SUPER_ADMIN_IDS", "1223243487,46279393,372873254,1302635272"))
+MANAGER_IDS = parse_id_list(os.getenv("MANAGER_IDS", "137334013"))
 
 # Timezone va do'kon ish vaqti
 TIMEZONE = "Asia/Tashkent"
@@ -29,6 +29,10 @@ WORK_END_HOUR = 23    # 23:00
 
 # MoySklad API Base
 MOYSKLAD_API_URL = "https://api.moysklad.ru/api/remap/1.2"
+
+# Central MoySklad Sync / Gateway API
+GATEWAY_API_URL = os.getenv("GATEWAY_API_URL", "http://127.0.0.1:8001/api/gateway").rstrip("/")
+USE_GATEWAY = os.getenv("USE_GATEWAY", "true").lower() == "true"
 
 def get_user_role(user_id: int) -> str | None:
     """Foydalanuvchi rolini aniqlaydi: 'super_admin', 'manager' yoki None"""

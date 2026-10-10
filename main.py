@@ -47,6 +47,7 @@ async def main():
 
     logger.info("🤖 Bot polling rejimida ishga tushdi...")
     try:
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()

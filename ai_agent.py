@@ -3,6 +3,8 @@ import json
 import base64
 import os
 import asyncio
+import time
+import re
 from typing import Dict, Any, Optional
 import config
 from moysklad_api import ms_api
@@ -13,30 +15,41 @@ class AIAgent:
         self.api_key = api_key
         # Eng barqaror va tezkor modellar ketma-ketligi (auto-fallback)
         self.models = [
-            "gemini-3.6-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite-preview"
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash",
+            "gemini-flash-latest"
         ]
+        self._context_cache: Dict[str, Any] = {}
+        self._cache_ttl = 60  # 60 soniya kesh (tezkor ishlash uchun)
 
     async def get_system_context(self, is_super_admin: bool = False) -> str:
-        """MoySkladdan ayni damdagi biznes ma'lumotlarini to'plab, AI uchun kontekst yaratadi"""
+        """MoySkladdan ayni damdagi biznes ma'lumotlarini to'plab, AI uchun kontekst yaratadi (Kesh bilan tezkor)"""
+        cache_key = f"ctx_admin_{is_super_admin}"
+        now_ts = time.time()
+        cached = self._context_cache.get(cache_key)
+        if cached and (now_ts - cached["time"] < self._cache_ttl):
+            return cached["data"]
+
         try:
             sales_task = ms_api.get_hourly_sales()
             stock_task = ms_api.get_stock_report()
             counterparties_task = ms_api.get_counterparties()
-            analytics_task = ms_api.get_products_analytics()
             
             if is_super_admin:
                 finance_task = ms_api.get_finance_balances()
-                sales, stock, counterparties, analytics, finance = await asyncio.gather(
-                    sales_task, stock_task, counterparties_task, analytics_task, finance_task
+                sales, stock, counterparties, finance = await asyncio.gather(
+                    sales_task, stock_task, counterparties_task, finance_task
                 )
             else:
-                sales, stock, counterparties, analytics = await asyncio.gather(
-                    sales_task, stock_task, counterparties_task, analytics_task
+                sales, stock, counterparties = await asyncio.gather(
+                    sales_task, stock_task, counterparties_task
                 )
                 finance = None
+
+            # Analytics ni mavjud stock bilan hisoblaymiz (qayta MoySkladga so'rov yubormasdan)
+            analytics = await ms_api.get_products_analytics(stock_data=stock)
 
             # Haqiqiy yetkazib beruvchilar ro'yxati
             sup_list = [c for c in counterparties if "покупатель" not in c["name"].lower()]
@@ -45,8 +58,11 @@ class AIAgent:
             # Guruhlar kesimidagi qoldiqlar
             folders_summary = []
             for f_name, f_data in stock.get("by_folder", {}).items():
+                f_qty = f_data.get("quantity") if f_data.get("quantity") is not None else f_data.get("qty", 0)
+                f_cost = f_data.get("cost_sum", 0.0)
+                f_sale = f_data.get("sale_sum", 0.0)
                 folders_summary.append(
-                    f"  • Guruh: '{f_name}' — {int(f_data['quantity'])} dona, Tan narxi: {f_data['cost_sum']:,.2f} so'm, Sotuv narxi: {f_data['sale_sum']:,.2f} so'm"
+                    f"  • Guruh: '{f_name}' — {int(f_qty)} dona, Tan narxi: {f_cost:,.2f} so'm, Sotuv narxi: {f_sale:,.2f} so'm"
                 )
             folders_str = "\n".join(folders_summary)
 
@@ -66,6 +82,20 @@ class AIAgent:
                 )
             low_str = "\n".join(low_lines)
 
+            # BAZADAGI BARCHA TOVARLAR RO'YXATI (KOD, NOM, QOLDIQ, NARX)
+            all_products_lines = []
+            for p in stock.get("raw_rows", []):
+                code = p.get("code", "")
+                name = p.get("name", "")
+                stk = int(p.get("stock", 0))
+                sale_p = p.get("sale_price", 0)
+                buy_p = p.get("buy_price", 0)
+                if is_super_admin:
+                    all_products_lines.append(f"• Kod: {code} | {name} | Qoldiq: {stk} dona | Sotuv: {sale_p:,.0f} so'm | Tan: {buy_p:,.0f} so'm")
+                else:
+                    all_products_lines.append(f"• Kod: {code} | {name} | Qoldiq: {stk} dona | Sotuv: {sale_p:,.0f} so'm")
+            all_products_str = "\n".join(all_products_lines)
+
             context_parts = [
                 f"Siz 'DE LUXURY' erkaklar kiyim do'konining professional biznes-analitik va boshqaruvchi AI maslahatchisisiz.",
                 f"Bugungi sana: {sales.get('date')}.",
@@ -83,6 +113,8 @@ class AIAgent:
                 f"{sup_names_str}",
                 f"\n⏱ --- BUGUNGI SAVDO KO'RSATKICHLARI ---",
                 f"Jami tushum: {sales.get('total_sum', 0):,.2f} so'm ({sales.get('total_count', 0)} ta chek)",
+                f"\n📋 --- OMBORDAGI BARCHA TOVARLAR VA ULARNING ANIQ KODLARI RO'YXATI ---",
+                f"{all_products_str}",
             ]
 
             if is_super_admin and finance:
@@ -96,29 +128,35 @@ class AIAgent:
                     context_parts.append(f" - {acc['name']}: {acc['balance']:,.2f}")
 
             context_parts.append(
-                f"\nQAT'IY KO'RSATMALAR VA MASLAHATLAR BERISH TARTIBI:"
-                f"1. AGAR FOYDALANUVCHI ENG KO'P/KAM SOTILGAN, QOLGAN YOKI MUZLAB TURGAN TOVARLARNI SO'RASA:"
-                f"   - Guruh bo'yicha emas, aynan YUQORIGI ANIQ TOVARLAR (nomlari va kodlari bilan) kesimida ro'yxat qilib bering."
-                f"   - Eng katta zaxiradagi tovarlar uchun: 'Ushbu tovarlarda eng ko'p summa muzlab turibdi. Sotuvni tezlashtirish uchun do'konning kirish qismiga joylashtirish, aksiya/chegirmalar e'lon qilish tavsiya etiladi' kabi amaliy biznes tavsiya bering."
-                f"   - Kam qolgan (1 dona) tovarlar uchun: 'Ushbu tovarlar deyarli tugagan. Talab bo'lsa yangi partiyaga buyurtma berish, yoki qolgan donalarini tezroq sotib tugatish maqsadga muvofiq' deb tavsiya bering."
-                f"2. QOLDIQ VA KIRIMNI FARQLASH:"
+                f"\nQAT'IY KO'RSATMALAR VA JAVOB BERISH QOIDALARI:"
+                f"1. TOVAR KODI YOKI NOMI SO'RALGANDA (MATN YOKI OVOZLI XABARDA):"
+                f"   - Agar foydalanuvchi biror tovar kodini (masalan: 00488, 00627, 00224...) yoki nomini aytib qoldig'ini so'rasa, YUQORIGI 'BARCHA TOVARLAR' ro'yxatidan AYNAN O'SHA KODNI toping."
+                f"   - O'sha tovarning nomi, ombordagi aniq qoldig'i va sotuv narxini aniq ayting."
+                f"   - Boshqa tovarlar (masalan muzlab turgan kapitaldagi 00627 Brooman yoki boshqa) bilan MUTLAQO chalkashtirmang!"
+                f"2. AGAR UMUMIY ENG KO'P/KAM SOTILGAN, QOLGAN YOKI MUZLAB TURGAN TOVARLARNI SO'RASA:"
+                f"   - Aynan YUQORIGI ANIQ TOVARLAR kesimida ro'yxat qilib amaliy biznes tavsiya bering."
+                f"3. QOLDIQ VA KIRIMNI FARQLASH:"
                 f"   - 'Qoldiq' / 'Guruh' so'ralsa -> Ombor qoldig'i (Excel: [GENERATE_EXCEL_STOCK_FOLDER:Guruh_Nomi] yoki [GENERATE_EXCEL_STOCKS])."
                 f"   - 'Kirim' / 'Yetkazib beruvchi' so'ralsa -> Kirim (Excel: [GENERATE_EXCEL_SUPPLY_AGENT:ID:NOMI] yoki [GENERATE_EXCEL_SUPPLIES])."
-                f"3. Doimo professional, do'stona va tushunarli o'zbek tilida javob bering."
+                f"4. Doimo professional, do'stona va tushunarli o'zbek tilida javob bering."
             )
 
-            return "\n".join(context_parts)
+            result_ctx = "\n".join(context_parts)
+            self._context_cache[cache_key] = {"time": now_ts, "data": result_ctx}
+            return result_ctx
         except Exception as e:
             print(f"Error building AI context: {e}")
             return "Siz 'DE LUXURY' do'konining AI analitikassisiz. Do'kon ma'lumotlari asosida tahlil bering."
 
     async def _call_gemini_with_fallback(self, payload: dict) -> Optional[str]:
-        """Modellarni navbat bilan sinab, birinchisi ishlaganida natijani qaytaradi"""
-        async with aiohttp.ClientSession() as session:
+        """Modellarni navbat bilan sinab, birinchisi ishlaganida natijani tezkor qaytaradi"""
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
             for model_name in self.models:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+                clean_name = model_name.replace("models/", "")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_name}:generateContent?key={self.api_key}"
                 try:
-                    async with session.post(url, json=payload, timeout=45) as resp:
+                    async with session.post(url, json=payload, timeout=12) as resp:
                         if resp.status == 200:
                             res_json = await resp.json()
                             candidates = res_json.get("candidates", [])
@@ -127,9 +165,9 @@ class AIAgent:
                                 if parts:
                                     return parts[0].get("text", "")
                         else:
-                            print(f"Model {model_name} returned status {resp.status}, trying next...")
+                            print(f"Model {clean_name} returned status {resp.status}, trying next...")
                 except Exception as e:
-                    print(f"Exception on model {model_name}: {e}")
+                    print(f"Exception on model {clean_name}: {e}")
                     continue
         return None
 
@@ -176,17 +214,37 @@ class AIAgent:
         """Matnli so'rovni tahlil qilib javob beradi"""
         system_instruction = await self.get_system_context(is_super_admin=is_super_admin)
         
+        # Agar savolda tovar kodi yoki son bo'lsa, uni bazadan tezkor topib ajratib beramiz
+        code_matches = re.findall(r'\b\d{3,6}\b', query)
+        extra_match_info = ""
+        if code_matches:
+            try:
+                stock_data = await ms_api.get_stock_report()
+                found_items = []
+                for row in stock_data.get("raw_rows", []):
+                    r_code = str(row.get("code", "")).strip()
+                    for c in code_matches:
+                        if c == r_code or (r_code and c.lstrip('0') == r_code.lstrip('0')):
+                            buy_str = f" | Tan narxi (Sebestoimost): {row.get('buy_price',0):,.0f} so'm" if is_super_admin else ""
+                            found_items.append(
+                                f"  • Nomi: '{row.get('name')}' | Kodi: {row.get('code')} | Ombordagi haqiqiy qoldiq: {int(row.get('stock',0))} dona | Sotuv narxi: {row.get('sale_price',0):,.0f} so'm{buy_str}"
+                            )
+                if found_items:
+                    extra_match_info = "\n\n🎯 SAVOLDA SO'RALGAN TOVAR(LAR)NING MOYSKLAD BAZASIDAGI ANIQ HAQIQIY MA'LUMOTLARI:\n" + "\n".join(found_items)
+            except Exception:
+                pass
+
         payload = {
             "contents": [
                 {
                     "role": "user",
                     "parts": [
-                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}\n\nFOYDALANUVCHI SAVOLI:\n{query}"}
+                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}{extra_match_info}\n\nFOYDALANUVCHI SAVOLI:\n{query}"}
                     ]
                 }
             ],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "maxOutputTokens": 2048
             }
         }
@@ -209,7 +267,7 @@ class AIAgent:
                 {
                     "role": "user",
                     "parts": [
-                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}\n\nQuyidagi ovozli xabarni diqqat bilan eshitib (Tovar guruhi yoki Kontragent ekanligini to'g'ri ajratib) javob bering:"},
+                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}\n\nQuyidagi ovozli xabarni diqqat bilan eshiting. Agar ovozda biror tovar kodi (masalan: 00488, 00627, 00224...) aytilsa, yuqoridagi BAZADAGI BARCHA TOVARLAR ro'yxatidan AYNAN O'SHA KODLI tovarning nomi, qoldig'i va narxini aniq ayting (aslo boshqa tovarlar bilan adashtirmang). Agar tovar guruhi yoki kontragent so'ralsa shunga mos javob bering:"},
                         {
                             "inline_data": {
                                 "mime_type": mime_type,
@@ -220,7 +278,7 @@ class AIAgent:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "maxOutputTokens": 2048
             }
         }

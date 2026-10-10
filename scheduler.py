@@ -24,7 +24,7 @@ async def send_hourly_report(bot: Bot):
     try:
         sales = await ms_api.get_hourly_sales()
         prev_hour = current_hour - 1 if current_hour > 0 else 23
-        prev_hour_data = sales["hourly"].get(prev_hour, {"count": 0, "sum": 0.0})
+        prev_hour_data = sales.get("hourly", {}).get(prev_hour) or sales.get("hourly", {}).get(str(prev_hour), {"count": 0, "sum": 0.0})
 
         msg_lines = [
             f"⏱ <b>DE LUXURY — SOATLIK SAVDO AVTO-HISOBOTI</b>",

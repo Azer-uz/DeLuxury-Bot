@@ -24,20 +24,29 @@ async def handle_hourly_sales(message: types.Message):
     ]
 
     has_any_sale = False
-    for hour, data in sales["hourly"].items():
+    curr_hour = int(sales.get("current_hour", 23))
+    for hour_k, data in sales.get("hourly", {}).items():
+        try:
+            hour = int(hour_k)
+        except (ValueError, TypeError):
+            continue
+
         # Faqat o'tgan soatlar va savdo bo'lgan yoki hozirgi soatni ko'rsatamiz
-        if hour <= sales["current_hour"]:
+        if hour <= curr_hour:
             hour_str = f"{hour:02d}:00 - {hour+1:02d}:00"
-            if data["count"] > 0:
+            if data.get("count", 0) > 0:
                 has_any_sale = True
-                lines.append(f"▫️ <b>{hour_str}:</b> {format_sum(data['sum'])} so'm ({data['count']} ta chek)")
+                lines.append(f"▫️ <b>{hour_str}:</b> {format_sum(data.get('sum', 0.0))} so'm ({data.get('count', 0)} ta chek)")
             else:
                 lines.append(f"▫️ <i>{hour_str}:</i> 0.00 so'm")
 
     lines.append(f"━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"💰 <b>JAMI TUSHUM:</b> <code>{format_sum(sales['total_sum'])} so'm</code>")
-    lines.append(f"🧾 <b>Cheklar soni:</b> {sales['total_count']} ta")
-    lines.append(f"📊 <b>O'rtacha chek:</b> {format_sum(sales['avg_check'])} so'm")
+    lines.append(f"💰 <b>JAMI TUSHUM:</b> <code>{format_sum(sales.get('total_sum', 0.0))} so'm</code>")
+    lines.append(f"🧾 <b>Cheklar soni:</b> {sales.get('total_count', 0)} ta")
+    lines.append(f"📊 <b>O'rtacha chek:</b> {format_sum(sales.get('avg_check', 0.0))} so'm")
 
-    await wait_msg.delete()
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
     await message.answer("\n".join(lines), parse_mode="HTML")

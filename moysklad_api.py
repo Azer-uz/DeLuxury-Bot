@@ -7,6 +7,30 @@ import config
 
 tz = pytz.timezone(config.TIMEZONE)
 
+def to_msk_filter_str(uz_dt_str: str) -> str:
+    """Toshkent (UTC+5) vaqtini MoySklad (Moskva UTC+3, -2 soat) vaqtiga o'tkazish"""
+    if not uz_dt_str:
+        return ""
+    try:
+        clean = uz_dt_str.split(".")[0].strip()
+        if len(clean) == 10:
+            clean += " 00:00:00"
+        dt = datetime.strptime(clean, "%Y-%m-%d %H:%M:%S")
+        return (dt - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return uz_dt_str
+
+def to_tashkent_dt(moment_str: str) -> Optional[datetime]:
+    """MoySklad (Moskva UTC+3) momentini Toshkent (UTC+5, +2 soat) ga o'tkazish"""
+    if not moment_str:
+        return None
+    try:
+        clean = moment_str.split(".")[0].strip()
+        dt = datetime.strptime(clean, "%Y-%m-%d %H:%M:%S")
+        return dt + timedelta(hours=2)
+    except Exception:
+        return None
+
 class MoySkladClient:
     def __init__(self, token: str = config.MOYSKLAD_TOKEN):
         self.token = token
@@ -17,9 +41,24 @@ class MoySkladClient:
             "Content-Type": "application/json"
         }
 
+    async def _request_gateway(self, endpoint: str, params: dict = None) -> Any:
+        if not getattr(config, "USE_GATEWAY", True):
+            return None
+        gateway_url = f"{getattr(config, 'GATEWAY_API_URL', 'http://127.0.0.1:8001/api/gateway')}/{endpoint.lstrip('/')}"
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                async with session.get(gateway_url, params=params, timeout=12) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            except Exception:
+                pass
+        return None
+
     async def _request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> Any:
         url = f"{self.base_url}/{endpoint}"
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(headers=self.headers, connector=connector) as session:
             try:
                 async with session.request(method, url, params=params, json=json_data, timeout=30) as resp:
                     if resp.status in (200, 201):
@@ -36,18 +75,38 @@ class MoySkladClient:
 
     # ================= 1. SOATLIK VA KUNLIK SAVDO =================
     async def get_hourly_sales(self, target_date: Optional[datetime.date] = None) -> Dict[str, Any]:
-        """Bugungi (yoki berilgan sanadagi) savdolarni soatma-soat hisoblaydi"""
+        """Bugungi (yoki berilgan sanadagi) savdolarni soatma-soat hisoblaydi (Toshkent vaqti bilan +2 soat sinxron)"""
+        now = datetime.now(tz)
         if target_date is None:
-            now = datetime.now(tz)
             target_date = now.date()
-        else:
-            now = datetime.now(tz)
 
-        start_str = f"{target_date.strftime('%Y-%m-%d')} 00:00:00"
-        end_str = f"{target_date.strftime('%Y-%m-%d')} 23:59:59"
+        date_key = target_date.strftime('%Y-%m-%d')
+        now_ts = datetime.now().timestamp()
+        
+        # 1. In-memory cache tekshirish (30 soniya)
+        if hasattr(self, "_hourly_cache"):
+            cached = self._hourly_cache.get(date_key)
+            if cached and (now_ts - cached["time"] < 30):
+                return cached["data"]
+        else:
+            self._hourly_cache = {}
+
+        # 2. Central Gateway orqali tezkor olish
+        gw_params = {"target_date": date_key}
+        gw_data = await self._request_gateway("sales/hourly", params=gw_params)
+        if gw_data and isinstance(gw_data, dict) and not gw_data.get("error"):
+            self._hourly_cache[date_key] = {"time": now_ts, "data": gw_data}
+            return gw_data
+
+        start_uz = f"{target_date.strftime('%Y-%m-%d')} 00:00:00"
+        end_uz = f"{target_date.strftime('%Y-%m-%d')} 23:59:59"
+
+        # MoySklad Moskva vaqtida (UTC+3) ishlagani uchun, Toshkent (UTC+5) sanasini -2 soatga o'tkazamiz
+        start_msk = to_msk_filter_str(start_uz)
+        end_msk = to_msk_filter_str(end_uz)
 
         # Retail demands (chakana savdo cheklari) va Demands (ulgurji/otgruzka)
-        filter_str = f"moment>={start_str};moment<={end_str}"
+        filter_str = f"moment>={start_msk};moment<={end_msk}"
         
         rd_task = self._request("GET", "entity/retaildemand", params={"filter": filter_str, "limit": 1000})
         dem_task = self._request("GET", "entity/demand", params={"filter": filter_str, "limit": 1000})
@@ -60,7 +119,7 @@ class MoySkladClient:
         if dem_data and "rows" in dem_data:
             all_sales.extend(dem_data["rows"])
 
-        # Soatlar bo'yicha guruhlash (09:00 dan 23:00 gacha)
+        # Soatlar bo'yicha guruhlash (09:00 dan 23:00 gacha Toshkent vaqti bilan)
         hourly_data = {hour: {"count": 0, "sum": 0.0} for hour in range(config.WORK_START_HOUR, config.WORK_END_HOUR + 1)}
         total_sum = 0.0
         total_count = len(all_sales)
@@ -72,18 +131,19 @@ class MoySkladClient:
 
             if moment_str:
                 try:
-                    # '2026-10-07 14:35:10' yoki '2026-10-07 14:35:10.123'
-                    dt = datetime.strptime(moment_str.split(".")[0], "%Y-%m-%d %H:%M:%S")
-                    hour = dt.hour
-                    if hour in hourly_data:
-                        hourly_data[hour]["count"] += 1
-                        hourly_data[hour]["sum"] += sale_sum
+                    # MoySklad Moskva vaqtini Toshkent vaqtiga (+2 soat) o'tkazamiz
+                    dt_uz = to_tashkent_dt(moment_str)
+                    if dt_uz:
+                        hour = dt_uz.hour
+                        if hour in hourly_data:
+                            hourly_data[hour]["count"] += 1
+                            hourly_data[hour]["sum"] += sale_sum
                 except Exception:
                     pass
 
         avg_check = (total_sum / total_count) if total_count > 0 else 0.0
 
-        return {
+        res = {
             "date": target_date.strftime("%d.%m.%Y"),
             "current_hour": now.hour,
             "total_sum": total_sum,
@@ -91,17 +151,28 @@ class MoySkladClient:
             "avg_check": avg_check,
             "hourly": hourly_data
         }
+        self._hourly_cache[date_key] = {"time": now_ts, "data": res}
+        return res
 
     # ================= 2. TOVAR KIRIMI (PRIYOMKA / SUPPLY) =================
     async def get_supplies(self, date_from: Optional[str] = None, date_to: Optional[str] = None, agent_id: Optional[str] = None) -> Dict[str, Any]:
         """Priyomka (kirim) hujjatlarini filtrlar bilan yuklaydi"""
+        # Check Central Gateway first
+        gw_params = {}
+        if date_from: gw_params["date_from"] = date_from
+        if date_to: gw_params["date_to"] = date_to
+        if agent_id: gw_params["agent_id"] = agent_id
+        gw_data = await self._request_gateway("supplies", params=gw_params)
+        if gw_data and isinstance(gw_data, dict) and not gw_data.get("error"):
+            return gw_data
+
         params = {"limit": 100, "expand": "agent,positions.assortment", "order": "moment,desc"}
         filters = []
         
         if date_from:
-            filters.append(f"moment>={date_from} 00:00:00")
+            filters.append(f"moment>={to_msk_filter_str(f'{date_from} 00:00:00')}")
         if date_to:
-            filters.append(f"moment<={date_to} 23:59:59")
+            filters.append(f"moment<={to_msk_filter_str(f'{date_to} 23:59:59')}")
         if agent_id:
             filters.append(f"agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{agent_id}")
 
@@ -128,13 +199,13 @@ class MoySkladClient:
                 by_agent[agent_name]["count"] += 1
                 by_agent[agent_name]["sum"] += s_sum
 
-                # Moment formatini chiroyli qilish
+                # Moment formatini Toshkent vaqtiga (+2 soat) o'tkazish
                 moment_raw = row.get("moment", "")
                 moment_fmt = ""
                 if moment_raw:
                     try:
-                        dt = datetime.strptime(moment_raw.split(".")[0], "%Y-%m-%d %H:%M:%S")
-                        moment_fmt = dt.strftime("%d.%m.%Y %H:%M")
+                        dt_uz = to_tashkent_dt(moment_raw)
+                        moment_fmt = dt_uz.strftime("%d.%m.%Y %H:%M") if dt_uz else moment_raw[:16]
                     except Exception:
                         moment_fmt = moment_raw[:16]
 
@@ -227,38 +298,50 @@ class MoySkladClient:
     # ================= 3. TOVAR QOLDIQLARI (OSTATKI) =================
     async def get_stock_report(self, folder_id: Optional[str] = None) -> Dict[str, Any]:
         """Barcha tovarlar qoldig'i, tan narxi va sotuv narxi summasini to'g'ri hisoblaydi va atributlar bilan boyitadi"""
+        now_ts = datetime.now().timestamp()
+        cache_key = f"stock_{folder_id}"
+        if not hasattr(self, "_stock_cache"):
+            self._stock_cache = {}
+        
+        cached = self._stock_cache.get(cache_key)
+        if cached and (now_ts - cached["time"] < 60):
+            return cached["data"]
+
+        # 1. Gateway orqali tekshirish
+        gw_params = {"folder_id": folder_id} if folder_id else None
+        gw_data = await self._request_gateway("stock/report", params=gw_params)
+        if gw_data and isinstance(gw_data, dict) and not gw_data.get("error") and gw_data.get("rows"):
+            res = {
+                "total_quantity": gw_data.get("total_qty", 0.0),
+                "total_cost_sum": gw_data.get("total_cost_price", 0.0),
+                "total_sale_sum": gw_data.get("total_sale_price", 0.0),
+                "by_folder": gw_data.get("by_folder", {}),
+                "raw_rows": [
+                    {
+                        "code": r.get("code", ""),
+                        "article": r.get("article", ""),
+                        "name": r.get("name", "Noma'lum"),
+                        "folder": r.get("folder", "Guruhsiz"),
+                        "stock": float(r.get("quantity", 0) or 0),
+                        "buy_price": float(r.get("cost_price", 0) or 0),
+                        "sale_price": float(r.get("sale_price", 0) or 0)
+                    }
+                    for r in gw_data.get("rows", [])
+                ]
+            }
+            self._stock_cache[cache_key] = {"time": now_ts, "data": res}
+            return res
+
         params = {"limit": 1000}
         if folder_id:
             params["productFolder"] = f"https://api.moysklad.ru/api/remap/1.2/entity/productfolder/{folder_id}"
 
-        # 1. Qoldiqlar hisoboti
-        stock_task = self._request("GET", "report/stock/all", params=params)
-        # 2. Barcha tovarlar (kodi, dop polya: Kategoriya, Vid tovara uchun)
-        prod_task = self._request("GET", "entity/product", params={"limit": 1000, "expand": "productFolder,attributes"})
-        
-        stock_data, prod_data = await asyncio.gather(stock_task, prod_task)
-
-        # Mahsulotlar xaritasi: id -> {code, category, vid_tovara}
-        prod_map = {}
-        if prod_data and "rows" in prod_data:
-            for p in prod_data["rows"]:
-                attrs = {}
-                for a in p.get("attributes", []):
-                    val = a.get("value", "")
-                    if isinstance(val, dict):
-                        val = val.get("name", "")
-                    attrs[a.get("name", "")] = str(val)
-
-                prod_map[p.get("id")] = {
-                    "code": p.get("code", ""),
-                    "article": p.get("article", ""),
-                    "category": attrs.get("Категория", "") or attrs.get("Kategoriya", ""),
-                    "vid_tovara": attrs.get("Вид товара", "") or attrs.get("Vid tovara", "")
-                }
+        # 2. Qoldiqlar hisoboti (report/stock/all)
+        stock_data = await self._request("GET", "report/stock/all", params=params)
 
         total_quantity = 0.0
-        total_cost_sum = 0.0   # Tan narxi bo'yicha jami (price * qty)
-        total_sale_sum = 0.0   # Sotuv narxi bo'yicha jami (salePrice * qty)
+        total_cost_sum = 0.0
+        total_sale_sum = 0.0
         by_folder = {}
         enriched_rows = []
 
@@ -270,10 +353,6 @@ class MoySkladClient:
 
                 total_quantity += qty
                 folder_name = row.get("folder", {}).get("name", "Guruhsiz")
-                
-                # MoySklad report/stock/all da:
-                # 'price' bu Tan Narx (Buy Price / Sebestoimost)
-                # 'salePrice' bu Sotuv Narxi (Sale Price)
                 buy_price = (row.get("price", 0) or 0) / 100.0
                 sale_price = (row.get("salePrice", 0) or 0) / 100.0
                 
@@ -295,21 +374,14 @@ class MoySkladClient:
                 by_folder[folder_name]["sale_sum"] += item_sale_total
                 by_folder[folder_name]["items_count"] += 1
 
-                # Mahsulot ID sini aniqlash (query parametrlardan tozalaymiz)
-                meta_href = row.get("meta", {}).get("href", "")
-                p_id = meta_href.split("/")[-1].split("?")[0] if "/" in meta_href else ""
-                row_code = row.get("code", "")
-                row_name = row.get("name", "")
-
-                p_info = prod_map.get(p_id) or prod_map.get(row_code) or prod_map.get(row_name) or {}
-
                 enriched_rows.append({
-                    "id": p_id,
-                    "code": p_info.get("code") or row_code,
-                    "name": row_name,
+                    "id": row.get("meta", {}).get("href", "").split("/")[-1].split("?")[0],
+                    "code": row.get("code", ""),
+                    "article": row.get("article", ""),
+                    "name": row.get("name", "Noma'lum"),
                     "folder": folder_name,
-                    "category": p_info.get("category", ""),
-                    "vid_tovara": p_info.get("vid_tovara", ""),
+                    "category": "",
+                    "vid_tovara": "",
                     "stock": qty,
                     "buy_price": buy_price,
                     "cost_total": item_cost_total,
@@ -317,13 +389,15 @@ class MoySkladClient:
                     "sale_total": item_sale_total
                 })
 
-        return {
+        res = {
             "total_quantity": total_quantity,
             "total_cost_sum": total_cost_sum,
             "total_sale_sum": total_sale_sum,
             "by_folder": by_folder,
             "raw_rows": enriched_rows
         }
+        self._stock_cache[cache_key] = {"time": now_ts, "data": res}
+        return res
 
     # ================= 4. TEZKOR TOVAR QIDIRUV (SHTRIX-KOD / KOD) =================
     async def search_product(self, query: str) -> Optional[Dict[str, Any]]:
@@ -432,7 +506,7 @@ class MoySkladClient:
             date_from = now.strftime("%Y-%m-%d")
             date_to = date_from
 
-        filter_str = f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59"
+        filter_str = f"moment>={to_msk_filter_str(f'{date_from} 00:00:00')};moment<={to_msk_filter_str(f'{date_to} 23:59:59')}"
         
         # Cashout (kassadan chiqim) va Paymentout (bankdan chiqim)
         co_task = self._request("GET", "entity/cashout", params={"filter": filter_str, "expand": "expenseItem", "limit": 500})
@@ -455,7 +529,10 @@ class MoySkladClient:
             total_expense += s
             item_name = exp.get("expenseItem", {}).get("name", "Boshqa xarajatlar")
             desc = exp.get("description", "") or exp.get("comment", "") or "Izohsiz"
-            moment = exp.get("moment", "")[:16]
+            
+            # Toshkent vaqtiga o'tkazamiz
+            dt_uz = to_tashkent_dt(exp.get("moment", ""))
+            moment = dt_uz.strftime("%d.%m.%Y %H:%M") if dt_uz else exp.get("moment", "")[:16]
 
             if item_name not in by_item:
                 by_item[item_name] = 0.0
@@ -477,9 +554,10 @@ class MoySkladClient:
         }
 
     # ================= 6. CHUQUR TOVAR VA QOLDIQ TAHLILI (TOP / LOW STOCK) =================
-    async def get_products_analytics(self) -> Dict[str, Any]:
+    async def get_products_analytics(self, stock_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Chuqur tovarlar tahlili: eng ko'p zaxira, eng kam qoldiq va tavsiyalar uchun ma'lumotlar"""
-        stock_data = await self.get_stock_report()
+        if stock_data is None:
+            stock_data = await self.get_stock_report()
         raw_rows = stock_data.get("raw_rows", [])
 
         # 1. Eng katta zaxiraga ega tovarlar (Muzlab turgan kapital bo'yicha)
