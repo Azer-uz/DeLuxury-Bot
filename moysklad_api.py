@@ -325,28 +325,26 @@ class MoySkladClient:
         if cached and (now_ts - cached["time"] < 60):
             return cached["data"]
 
-        # 1. Gateway orqali tekshirish
+        # 1. Gateway orqali tekshirish (uning javobi boshqa shaklda: quantity/cost_price, by_folder.qty)
         gw_params = {"folder_id": folder_id} if folder_id else None
         gw_data = await self._request_gateway("stock/report", params=gw_params)
         if gw_data and isinstance(gw_data, dict) and not gw_data.get("error") and gw_data.get("rows"):
-            res = {
-                "total_quantity": gw_data.get("total_qty", 0.0),
-                "total_cost_sum": gw_data.get("total_cost_price", 0.0),
-                "total_sale_sum": gw_data.get("total_sale_price", 0.0),
-                "by_folder": gw_data.get("by_folder", {}),
-                "raw_rows": [
-                    {
-                        "code": r.get("code", ""),
-                        "article": r.get("article", ""),
-                        "name": r.get("name", "Noma'lum"),
-                        "folder": r.get("folder", "Guruhsiz"),
-                        "stock": float(r.get("quantity", 0) or 0),
-                        "buy_price": float(r.get("cost_price", 0) or 0),
-                        "sale_price": float(r.get("sale_price", 0) or 0)
-                    }
-                    for r in gw_data.get("rows", [])
-                ]
-            }
+            items = [
+                {
+                    "id": r.get("id", ""),
+                    "code": r.get("code", ""),
+                    "article": r.get("article", ""),
+                    "name": r.get("name", "Noma'lum"),
+                    "folder": r.get("folder", "Guruhsiz"),
+                    "category": r.get("category", ""),
+                    "vid_tovara": r.get("vid_tovara", ""),
+                    "stock": float(r.get("quantity", 0) or 0),
+                    "buy_price": float(r.get("cost_price", 0) or 0),
+                    "sale_price": float(r.get("sale_price", 0) or 0),
+                }
+                for r in gw_data["rows"]
+            ]
+            res = self._summarize_stock(items)
             self._stock_cache[cache_key] = {"time": now_ts, "data": res}
             return res
 
@@ -356,66 +354,59 @@ class MoySkladClient:
 
         # 2. Qoldiqlar hisoboti (report/stock/all)
         stock_data = await self._request("GET", "report/stock/all", params=params)
+        items = [
+            {
+                "id": row.get("meta", {}).get("href", "").split("/")[-1].split("?")[0],
+                "code": row.get("code", ""),
+                "article": row.get("article", ""),
+                "name": row.get("name", "Noma'lum"),
+                "folder": row.get("folder", {}).get("name", "Guruhsiz"),
+                "category": "",
+                "vid_tovara": "",
+                "stock": float(row.get("stock", 0) or 0),
+                "buy_price": (row.get("price", 0) or 0) / 100.0,
+                "sale_price": (row.get("salePrice", 0) or 0) / 100.0,
+            }
+            for row in (stock_data or {}).get("rows", [])
+        ]
+        res = self._summarize_stock(items)
+        self._stock_cache[cache_key] = {"time": now_ts, "data": res}
+        return res
 
+    @staticmethod
+    def _summarize_stock(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Musbat qoldiqli tovarlar bo'yicha jami va guruhlar kesimini hisoblaydi (Gateway va MoySklad uchun bir xil natija)"""
         total_quantity = 0.0
         total_cost_sum = 0.0
         total_sale_sum = 0.0
-        by_folder = {}
+        by_folder: Dict[str, Dict[str, float]] = {}
         enriched_rows = []
 
-        if stock_data and "rows" in stock_data:
-            for row in stock_data["rows"]:
-                qty = float(row.get("stock", 0) or 0)
-                if qty <= 0:
-                    continue
+        for item in items:
+            qty = item["stock"]
+            if qty <= 0:
+                continue
+            item_cost_total = item["buy_price"] * qty
+            item_sale_total = item["sale_price"] * qty
+            total_quantity += qty
+            total_cost_sum += item_cost_total
+            total_sale_sum += item_sale_total
 
-                total_quantity += qty
-                folder_name = row.get("folder", {}).get("name", "Guruhsiz")
-                buy_price = (row.get("price", 0) or 0) / 100.0
-                sale_price = (row.get("salePrice", 0) or 0) / 100.0
-                
-                item_cost_total = buy_price * qty
-                item_sale_total = sale_price * qty
-                
-                total_cost_sum += item_cost_total
-                total_sale_sum += item_sale_total
+            f = by_folder.setdefault(item["folder"], {"quantity": 0.0, "cost_sum": 0.0, "sale_sum": 0.0, "items_count": 0})
+            f["quantity"] += qty
+            f["cost_sum"] += item_cost_total
+            f["sale_sum"] += item_sale_total
+            f["items_count"] += 1
 
-                if folder_name not in by_folder:
-                    by_folder[folder_name] = {
-                        "quantity": 0.0,
-                        "cost_sum": 0.0,
-                        "sale_sum": 0.0,
-                        "items_count": 0
-                    }
-                by_folder[folder_name]["quantity"] += qty
-                by_folder[folder_name]["cost_sum"] += item_cost_total
-                by_folder[folder_name]["sale_sum"] += item_sale_total
-                by_folder[folder_name]["items_count"] += 1
+            enriched_rows.append({**item, "cost_total": item_cost_total, "sale_total": item_sale_total})
 
-                enriched_rows.append({
-                    "id": row.get("meta", {}).get("href", "").split("/")[-1].split("?")[0],
-                    "code": row.get("code", ""),
-                    "article": row.get("article", ""),
-                    "name": row.get("name", "Noma'lum"),
-                    "folder": folder_name,
-                    "category": "",
-                    "vid_tovara": "",
-                    "stock": qty,
-                    "buy_price": buy_price,
-                    "cost_total": item_cost_total,
-                    "sale_price": sale_price,
-                    "sale_total": item_sale_total
-                })
-
-        res = {
+        return {
             "total_quantity": total_quantity,
             "total_cost_sum": total_cost_sum,
             "total_sale_sum": total_sale_sum,
             "by_folder": by_folder,
             "raw_rows": enriched_rows
         }
-        self._stock_cache[cache_key] = {"time": now_ts, "data": res}
-        return res
 
     # ================= 4. TEZKOR TOVAR QIDIRUV (SHTRIX-KOD / KOD) =================
     async def search_product(self, query: str) -> Optional[Dict[str, Any]]:
