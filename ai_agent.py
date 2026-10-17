@@ -1,28 +1,62 @@
 import aiohttp
-import json
 import base64
-import os
 import asyncio
+import logging
 import time
 import re
-from typing import Dict, Any, Optional
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+import pytz
 import config
 from moysklad_api import ms_api
-from excel_generator import ExcelGenerator
+
+logger = logging.getLogger(__name__)
+tz = pytz.timezone(config.TIMEZONE)
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Bitta modelga kutish (kontekst ~45k token, thinkingLevel=low bilan javob 6–10 s) va barcha urinishlar uchun umumiy limit
+MODEL_TIMEOUT = 30
+TOTAL_DEADLINE = 80
+# Suhbat xotirasi: oxirgi 4 savol-javob, 30 daqiqa jimlikdan keyin tozalanadi
+HISTORY_TURNS = 4
+HISTORY_TTL = 30 * 60
+
+EXCEL_TAG_RE = re.compile(r"\[GENERATE_EXCEL_(STOCK_FOLDER|SUPPLY_AGENT|STOCKS|SUPPLIES)(?::([^\]]*))?\]")
 
 class AIAgent:
     def __init__(self, api_key: str = config.GEMINI_API_KEY):
         self.api_key = api_key
-        # Eng barqaror va tezkor modellar ketma-ketligi (auto-fallback)
+        # Modellar ketma-ketligi (auto-fallback): eng tezkori birinchi. Hammasi thinkingLevel ni qo'llab-quvvatlaydi
         self.models = [
             "gemini-3-flash-preview",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-3.7-flash",
-            "gemini-3.5-flash",
-            "gemini-flash-latest"
+            "gemini-3.8-flash",
+            "gemini-3.5-flash"
         ]
         self._context_cache: Dict[str, Any] = {}
         self._cache_ttl = 60  # 60 soniya kesh (tezkor ishlash uchun)
+        self._history: Dict[int, Dict[str, Any]] = {}
+
+    # ================= SUHBAT XOTIRASI =================
+    def _get_history(self, user_id: Optional[int]) -> List[dict]:
+        if user_id is None:
+            return []
+        entry = self._history.get(user_id)
+        if not entry or time.time() - entry["time"] > HISTORY_TTL:
+            self._history.pop(user_id, None)
+            return []
+        return list(entry["turns"])
+
+    def _remember(self, user_id: Optional[int], user_text: str, reply_text: str):
+        if user_id is None or not reply_text:
+            return
+        entry = self._history.setdefault(user_id, {"time": 0, "turns": deque(maxlen=HISTORY_TURNS * 2)})
+        entry["turns"].append({"role": "user", "parts": [{"text": user_text}]})
+        entry["turns"].append({"role": "model", "parts": [{"text": reply_text}]})
+        entry["time"] = time.time()
+
+    def clear_history(self, user_id: int):
+        self._history.pop(user_id, None)
 
     async def get_system_context(self, is_super_admin: bool = False) -> str:
         """MoySkladdan ayni damdagi biznes ma'lumotlarini to'plab, AI uchun kontekst yaratadi (Kesh bilan tezkor)"""
@@ -33,20 +67,24 @@ class AIAgent:
             return cached["data"]
 
         try:
-            sales_task = ms_api.get_hourly_sales()
-            stock_task = ms_api.get_stock_report()
-            counterparties_task = ms_api.get_counterparties()
-            
+            now = datetime.now(tz)
+            yesterday = now.date() - timedelta(days=1)
+            tasks = [
+                ms_api.get_hourly_sales(),
+                ms_api.get_hourly_sales(yesterday),
+                ms_api.get_stock_report(),
+                ms_api.get_counterparties(),
+            ]
             if is_super_admin:
-                finance_task = ms_api.get_finance_balances()
-                sales, stock, counterparties, finance = await asyncio.gather(
-                    sales_task, stock_task, counterparties_task, finance_task
-                )
-            else:
-                sales, stock, counterparties = await asyncio.gather(
-                    sales_task, stock_task, counterparties_task
-                )
-                finance = None
+                tasks.append(ms_api.get_finance_balances())
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Savdo olinmasa ham AI ombor bo'yicha javob bera olsin
+            sales, y_sales, stock, counterparties = [
+                None if isinstance(r, Exception) else r for r in results[:4]
+            ]
+            finance = results[4] if is_super_admin and not isinstance(results[4], Exception) else None
+            stock = stock or {}
+            counterparties = counterparties or []
 
             # Analytics ni mavjud stock bilan hisoblaymiz (qayta MoySkladga so'rov yubormasdan)
             analytics = await ms_api.get_products_analytics(stock_data=stock)
@@ -96,9 +134,12 @@ class AIAgent:
                     all_products_lines.append(f"• Kod: {code} | {name} | Qoldiq: {stk} dona | Sotuv: {sale_p:,.0f} so'm")
             all_products_str = "\n".join(all_products_lines)
 
+            sales_str = self._format_sales_for_context(sales, "BUGUNGI")
+            y_sales_str = self._format_sales_for_context(y_sales, f"KECHAGI ({yesterday.strftime('%d.%m.%Y')})")
+
             context_parts = [
                 f"Siz 'DE LUXURY' erkaklar kiyim do'konining professional biznes-analitik va boshqaruvchi AI maslahatchisisiz.",
-                f"Bugungi sana: {sales.get('date')}.",
+                f"Bugungi sana va hozirgi vaqt (Toshkent): {now.strftime('%d.%m.%Y %H:%M')}. Do'kon ish vaqti: {config.WORK_START_HOUR:02d}:00–{config.WORK_END_HOUR:02d}:00.",
                 f"\n📦 --- OMBORNING UMUMIY HOLATI ---",
                 f"Jami tovarlar soni: {stock.get('total_quantity', 0)} dona (jami {analytics.get('total_items_count', 0)} xil pozitsiya)",
                 f"Jami tovarlar tan narxi (Sebestoimost): {stock.get('total_cost_sum', 0):,.2f} so'm",
@@ -111,8 +152,8 @@ class AIAgent:
                 f"{low_str}",
                 f"\n🏢 --- BAZADAGI HAQIQIY YETKAZIB BERUVCHILAR (KONTRAGENTLAR) ---",
                 f"{sup_names_str}",
-                f"\n⏱ --- BUGUNGI SAVDO KO'RSATKICHLARI ---",
-                f"Jami tushum: {sales.get('total_sum', 0):,.2f} so'm ({sales.get('total_count', 0)} ta chek)",
+                sales_str,
+                y_sales_str,
                 f"\n📋 --- OMBORDAGI BARCHA TOVARLAR VA ULARNING ANIQ KODLARI RO'YXATI ---",
                 f"{all_products_str}",
             ]
@@ -139,78 +180,99 @@ class AIAgent:
                 f"   - 'Qoldiq' / 'Guruh' so'ralsa -> Ombor qoldig'i (Excel: [GENERATE_EXCEL_STOCK_FOLDER:Guruh_Nomi] yoki [GENERATE_EXCEL_STOCKS])."
                 f"   - 'Kirim' / 'Yetkazib beruvchi' so'ralsa -> Kirim (Excel: [GENERATE_EXCEL_SUPPLY_AGENT:ID:NOMI] yoki [GENERATE_EXCEL_SUPPLIES])."
                 f"4. Doimo professional, do'stona va tushunarli o'zbek tilida javob bering."
+                f"5. JAVOB FORMATI: javob Telegram'da ko'rsatiladi — jadval (| ... |) ishlatmang, ro'yxat va **qalin** matndan foydalaning. Javob qisqa va aniq bo'lsin."
+                f"6. Savdo summalari SOF tushum (savdo − vozvrat). Kontekstda yo'q davr (masalan o'tgan oy) savdosi so'ralsa, raqam o'ylab topmang — bu ma'lumot «⏱ Soatlik Savdo» bo'limida yoki MoySkladda ekanini ayting."
             )
 
             result_ctx = "\n".join(context_parts)
             self._context_cache[cache_key] = {"time": now_ts, "data": result_ctx}
             return result_ctx
         except Exception as e:
-            print(f"Error building AI context: {e}")
+            logger.exception(f"Error building AI context: {e}")
             return "Siz 'DE LUXURY' do'konining AI analitikassisiz. Do'kon ma'lumotlari asosida tahlil bering."
 
+    @staticmethod
+    def _format_sales_for_context(sales: Optional[Dict[str, Any]], title: str) -> str:
+        if not sales:
+            return f"\n⏱ --- {title} SAVDO --- (MoySkladdan vaqtincha olinmadi)"
+        lines = [
+            f"\n⏱ --- {title} SAVDO KO'RSATKICHLARI ({sales['date']}) ---",
+            f"Sof tushum: {sales['total_sum']:,.2f} so'm | Savdo: {sales['gross_sum']:,.2f} so'm ({sales['total_count']} ta chek) | "
+            f"Vozvrat: {sales['return_sum']:,.2f} so'm ({sales['return_count']} ta) | O'rtacha chek: {sales['avg_check']:,.2f} so'm",
+            "Soatlar kesimida (faqat savdo bo'lgan soatlar):",
+        ]
+        for hour, d in sorted(sales["hourly"].items()):
+            if d["count"] or d["return_count"]:
+                row = f"  {hour:02d}:00-{(hour + 1) % 24:02d}:00 — {d['sum']:,.0f} so'm ({d['count']} ta chek)"
+                if d["return_count"]:
+                    row += f", vozvrat {d['return_sum']:,.0f} so'm"
+                lines.append(row)
+        if len(lines) == 3:
+            lines.append("  (savdo yo'q)")
+        return "\n".join(lines)
+
     async def _call_gemini_with_fallback(self, payload: dict) -> Optional[str]:
-        """Modellarni navbat bilan sinab, birinchisi ishlaganida natijani tezkor qaytaradi"""
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        """Modellarni navbat bilan sinab, birinchisi ishlaganida natijani qaytaradi"""
+        deadline = time.monotonic() + TOTAL_DEADLINE
+        headers = {"x-goog-api-key": self.api_key}  # kalit URL'da emas — loglarga tushmasligi uchun
+        async with aiohttp.ClientSession(headers=headers) as session:
             for model_name in self.models:
-                clean_name = model_name.replace("models/", "")
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_name}:generateContent?key={self.api_key}"
+                remaining = deadline - time.monotonic()
+                if remaining < 5:
+                    break
+                timeout = aiohttp.ClientTimeout(total=min(MODEL_TIMEOUT, remaining))
                 try:
-                    async with session.post(url, json=payload, timeout=12) as resp:
-                        if resp.status == 200:
-                            res_json = await resp.json()
-                            candidates = res_json.get("candidates", [])
-                            if candidates and "content" in candidates[0]:
-                                parts = candidates[0]["content"].get("parts", [])
-                                if parts:
-                                    return parts[0].get("text", "")
-                        else:
-                            print(f"Model {clean_name} returned status {resp.status}, trying next...")
+                    async with session.post(GEMINI_URL.format(model=model_name), json=payload, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.warning(f"Model {model_name} returned status {resp.status}: {body[:200]}")
+                            continue
+                        res_json = await resp.json()
                 except Exception as e:
-                    print(f"Exception on model {clean_name}: {e}")
+                    logger.warning(f"Exception on model {model_name}: {e!r}")
                     continue
+
+                candidates = res_json.get("candidates", [])
+                if not candidates:
+                    logger.warning(f"Model {model_name}: javob bo'sh ({res_json.get('promptFeedback')})")
+                    continue
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                if text.strip():
+                    return text
+                logger.warning(f"Model {model_name}: matnsiz javob, finishReason={candidates[0].get('finishReason')}")
         return None
 
     def _extract_excel_meta(self, reply_text: str) -> tuple[str, Optional[dict]]:
-        """AI javobidan Excel generatsiya teglarini ajratib oladi"""
+        """AI javobidan Excel generatsiya tegini ajratib oladi (birinchisi ishlatiladi, hammasi matndan olib tashlanadi)"""
         excel_meta = None
-        
-        # 1. Guruh bo'yicha qoldiq Excel: [GENERATE_EXCEL_STOCK_FOLDER:folder_name]
-        if "[GENERATE_EXCEL_STOCK_FOLDER:" in reply_text:
-            start_idx = reply_text.find("[GENERATE_EXCEL_STOCK_FOLDER:")
-            end_idx = reply_text.find("]", start_idx)
-            if end_idx != -1:
-                tag = reply_text[start_idx:end_idx+1]
-                folder_name = tag[len("[GENERATE_EXCEL_STOCK_FOLDER:"):-1].strip()
-                excel_meta = {"type": "stock_folder", "folder_name": folder_name}
-                reply_text = reply_text.replace(tag, "").strip()
+        match = EXCEL_TAG_RE.search(reply_text)
+        if match:
+            kind, arg = match.group(1), (match.group(2) or "").strip()
+            if kind == "STOCK_FOLDER" and arg:
+                excel_meta = {"type": "stock_folder", "folder_name": arg}
+            elif kind == "SUPPLY_AGENT" and arg:
+                agent_id, _, agent_name = arg.partition(":")
+                excel_meta = {"type": "supply_agent", "agent_id": agent_id.strip(), "agent_name": agent_name.strip() or "Kontragent"}
+            elif kind == "STOCKS":
+                excel_meta = {"type": "stocks"}
+            elif kind == "SUPPLIES":
+                excel_meta = {"type": "supplies"}
+        return EXCEL_TAG_RE.sub("", reply_text).strip(), excel_meta
 
-        # 2. Yetkazib beruvchi kirimi Excel: [GENERATE_EXCEL_SUPPLY_AGENT:id:name]
-        elif "[GENERATE_EXCEL_SUPPLY_AGENT:" in reply_text:
-            start_idx = reply_text.find("[GENERATE_EXCEL_SUPPLY_AGENT:")
-            end_idx = reply_text.find("]", start_idx)
-            if end_idx != -1:
-                tag = reply_text[start_idx:end_idx+1]
-                inner = tag[len("[GENERATE_EXCEL_SUPPLY_AGENT:"):-1]
-                parts = inner.split(":")
-                agent_id = parts[0].strip()
-                agent_name = parts[1].strip() if len(parts) > 1 else "Kontragent"
-                excel_meta = {"type": "supply_agent", "agent_id": agent_id, "agent_name": agent_name}
-                reply_text = reply_text.replace(tag, "").strip()
+    def _build_payload(self, system_instruction: str, history: List[dict], user_parts: List[dict]) -> dict:
+        return {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": history + [{"role": "user", "parts": user_parts}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 4096,
+                # "low" — sifat saqlangan holda javob ~2 baravar tez (standart thinking 10–17 s)
+                "thinkingConfig": {"thinkingLevel": "low"}
+            }
+        }
 
-        # 3. Umumiy qoldiqlar: [GENERATE_EXCEL_STOCKS]
-        elif "[GENERATE_EXCEL_STOCKS]" in reply_text:
-            excel_meta = {"type": "stocks"}
-            reply_text = reply_text.replace("[GENERATE_EXCEL_STOCKS]", "").strip()
-
-        # 4. Umumiy kirimlar: [GENERATE_EXCEL_SUPPLIES]
-        elif "[GENERATE_EXCEL_SUPPLIES]" in reply_text:
-            excel_meta = {"type": "supplies"}
-            reply_text = reply_text.replace("[GENERATE_EXCEL_SUPPLIES]", "").strip()
-
-        return reply_text, excel_meta
-
-    async def process_text_query(self, query: str, is_super_admin: bool = False) -> Dict[str, Any]:
+    async def process_text_query(self, query: str, is_super_admin: bool = False, user_id: Optional[int] = None) -> Dict[str, Any]:
         """Matnli so'rovni tahlil qilib javob beradi"""
         system_instruction = await self.get_system_context(is_super_admin=is_super_admin)
         
@@ -234,58 +296,38 @@ class AIAgent:
             except Exception:
                 pass
 
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}{extra_match_info}\n\nFOYDALANUVCHI SAVOLI:\n{query}"}
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2048
-            }
-        }
+        history = self._get_history(user_id)
+        user_text = f"{query}{extra_match_info}"
+        payload = self._build_payload(system_instruction, history, [{"text": user_text}])
 
         reply_text = await self._call_gemini_with_fallback(payload)
-        
+
         if reply_text:
+            self._remember(user_id, query, reply_text)
             clean_text, excel_meta = self._extract_excel_meta(reply_text)
             return {"text": clean_text, "excel_meta": excel_meta}
 
         return {"text": "Kechirasiz, sun'iy intellekt serverida vaqtincha uzilish bo'ldi. Iltimos, bir ozdan so'ng qayta urinib ko'ring.", "excel_meta": None}
 
-    async def process_voice_query(self, audio_bytes: bytes, mime_type: str = "audio/ogg", is_super_admin: bool = False) -> Dict[str, Any]:
+    async def process_voice_query(self, audio_bytes: bytes, mime_type: str = "audio/ogg", is_super_admin: bool = False, user_id: Optional[int] = None) -> Dict[str, Any]:
         """Ovozli xabarni (Telegram voice) qabul qilib, uni tushunadi va javob qaytaradi"""
         system_instruction = await self.get_system_context(is_super_admin=is_super_admin)
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": f"SISTEMA KO'RSATMASI VA BAZA MA'LUMOTLARI:\n{system_instruction}\n\nQuyidagi ovozli xabarni diqqat bilan eshiting. Agar ovozda biror tovar kodi (masalan: 00488, 00627, 00224...) aytilsa, yuqoridagi BAZADAGI BARCHA TOVARLAR ro'yxatidan AYNAN O'SHA KODLI tovarning nomi, qoldig'i va narxini aniq ayting (aslo boshqa tovarlar bilan adashtirmang). Agar tovar guruhi yoki kontragent so'ralsa shunga mos javob bering:"},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": audio_b64
-                            }
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2048
-            }
-        }
+        history = self._get_history(user_id)
+        user_parts = [
+            {"text": "Quyidagi ovozli xabarni diqqat bilan eshiting. Javobni birinchi qatorda «🎙 Savol: <ovozli xabar matni>» ko'rinishida boshlang. "
+                     "Agar ovozda biror tovar kodi (masalan: 00488, 00627, 00224...) aytilsa, BAZADAGI BARCHA TOVARLAR ro'yxatidan AYNAN O'SHA KODLI tovarning nomi, qoldig'i va narxini aniq ayting (aslo boshqa tovarlar bilan adashtirmang). "
+                     "Agar tovar guruhi yoki kontragent so'ralsa shunga mos javob bering:"},
+            {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+        ]
+        payload = self._build_payload(system_instruction, history, user_parts)
 
         reply_text = await self._call_gemini_with_fallback(payload)
 
         if reply_text:
+            # Xotiraga audio emas, javob saqlanadi (uning birinchi qatorida AI tushungan savol matni bor)
+            self._remember(user_id, "(Ovozli xabar — savol matni javobning birinchi qatorida)", reply_text)
             clean_text, excel_meta = self._extract_excel_meta(reply_text)
             return {"text": clean_text, "excel_meta": excel_meta}
 

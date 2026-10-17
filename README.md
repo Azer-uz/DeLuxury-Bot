@@ -6,8 +6,11 @@ Ushbu loyiha **"DE LUXURY"** erkaklar kiyim do'koni uchun yaratilgan maxsus bosh
 
 ## 🚀 Asosiy Imkoniyatlar
 
-1. **⏱ Soatlik Savdo Monitoringi (09:00 - 23:00):**
-   - Har soat oxirida avtomatik ravishda o'tgan soatdagi savdo, cheklar soni, o'rtacha chek va kunlik jami tushumni Telegram orqali yuboradi.
+1. **⏱ Soatlik Savdo Monitoringi (24/7):**
+   - Har soatning 2-daqiqasida o'tgan soatdagi savdo, vozvrat, cheklar soni, o'rtacha chek va kunlik SOF tushumni (savdo − vozvrat) yuboradi.
+   - Ish vaqtida (09:00–23:00) hisobot har doim keladi; ish vaqtidan tashqarida — faqat savdo bo'lsa («🌙 Ish vaqtidan tashqari savdo»).
+   - Har kuni 00:05 da **Kun yakuni** hisoboti: soatlar kesimi, eng yaxshi soat, oldingi kun va o'tgan hafta bilan solishtirish.
+   - MoySklad javob bermasa, "0 so'm" o'rniga rahbarga ogohlantirish yuboriladi.
 2. **📦 Tovar Kirimlari (Priyomka) & Yetkazib Beruvchilar:**
    - Kontragentlar (*Karvon, Turkiya Istanbul, Xitoy Abu Saxiy va h.k.*) yoki sanalar bo'yicha kirim hujjatlarini ko'rish.
    - Har bir kontragent bo'yicha tovar kodi, nomi, guruhi, kategoriyasi, vid tovari va narxlari aks etgan batafsil **Excel (.xlsx)** hisobotini yuklab berish.
@@ -21,6 +24,7 @@ Ushbu loyiha **"DE LUXURY"** erkaklar kiyim do'koni uchun yaratilgan maxsus bosh
    - Ovozli xabarlarni tushunish va MoySklad bazasi asosida professional tahlillar taqdim etish.
    - Eng ko'p zaxiraga ega (muzlab turgan kapital) va tugab borayotgan tovarlar kesimida amaliy biznes tavsiyalar.
    - Foydalanuvchi so'rovi bilan avtomatik Excel jadvallar yaratish.
+   - Oxirgi 4 ta savol-javobni eslab qoladi (30 daqiqa); yangi mavzu uchun /yangi.
 
 ---
 

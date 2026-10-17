@@ -68,8 +68,11 @@ async def start_search(message: types.Message, state: FSMContext):
 
 @router.message(SearchState.waiting_for_query)
 async def process_search_query(message: types.Message, state: FSMContext):
-    query = message.text.strip()
     await state.clear()
+    if not message.text:
+        await message.answer("❌ Qidiruv uchun shtrix-kod, kod yoki nomni matn ko'rinishida yuboring.")
+        return
+    query = message.text.strip()
 
     wait_msg = await message.answer(f"🔍 <i>'{query}' bo'yicha qidirilmoqda...</i>", parse_mode="HTML")
     

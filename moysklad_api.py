@@ -1,11 +1,17 @@
 import asyncio
+import logging
+import time
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import pytz
 from typing import Dict, List, Any, Optional
 import config
 
 tz = pytz.timezone(config.TIMEZONE)
+logger = logging.getLogger(__name__)
+
+class MoySkladError(Exception):
+    """MoySklad API'dan ma'lumot olib bo'lmadi (tarmoq, limit yoki server xatosi)"""
 
 def to_msk_filter_str(uz_dt_str: str) -> str:
     """Toshkent (UTC+5) vaqtini MoySklad (Moskva UTC+3, -2 soat) vaqtiga o'tkazish"""
@@ -40,13 +46,15 @@ class MoySkladClient:
             "Accept-Encoding": "gzip",
             "Content-Type": "application/json"
         }
+        self._hourly_cache: Dict[str, Any] = {}
+        # MoySklad bitta foydalanuvchiga 5 tadan ortiq parallel so'rovga 429 qaytaradi
+        self._semaphore = asyncio.Semaphore(4)
 
     async def _request_gateway(self, endpoint: str, params: dict = None) -> Any:
         if not getattr(config, "USE_GATEWAY", True):
             return None
         gateway_url = f"{getattr(config, 'GATEWAY_API_URL', 'http://127.0.0.1:8001/api/gateway')}/{endpoint.lstrip('/')}"
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(gateway_url, params=params, timeout=12) as resp:
                     if resp.status == 200:
@@ -57,98 +65,108 @@ class MoySkladClient:
 
     async def _request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> Any:
         url = f"{self.base_url}/{endpoint}"
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(headers=self.headers, connector=connector) as session:
-            try:
-                async with session.request(method, url, params=params, json=json_data, timeout=30) as resp:
-                    if resp.status in (200, 201):
-                        return await resp.json()
-                    elif resp.status == 204:
-                        return True
-                    else:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
+            for attempt in range(3):
+                try:
+                    async with self._semaphore, session.request(method, url, params=params, json=json_data) as resp:
+                        if resp.status in (200, 201):
+                            return await resp.json()
+                        elif resp.status == 204:
+                            return True
                         error_text = await resp.text()
-                        print(f"MoySklad API Error [{resp.status}] on {endpoint}: {error_text[:200]}")
-                        return None
-            except Exception as e:
-                print(f"Request exception on {endpoint}: {e}")
+                        logger.warning(f"MoySklad API Error [{resp.status}] on {endpoint}: {error_text[:200]}")
+                        # 429 (limit) va 5xx — vaqtinchalik xato, qayta urinamiz
+                        if resp.status != 429 and resp.status < 500:
+                            return None
+                except Exception as e:
+                    logger.warning(f"Request exception on {endpoint}: {e!r}")
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        return None
+
+    async def _fetch_all_rows(self, endpoint: str, params: dict) -> Optional[List[Dict[str, Any]]]:
+        """Barcha sahifalarni (limit 1000) yig'ib qaytaradi. Xato bo'lsa None (bo'sh ro'yxat bilan adashtirmaslik uchun)."""
+        rows: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            data = await self._request("GET", endpoint, params={**params, "limit": 1000, "offset": offset})
+            if not isinstance(data, dict) or "rows" not in data:
                 return None
+            rows.extend(data["rows"])
+            size = data.get("meta", {}).get("size", 0)
+            offset += 1000
+            if offset >= size or not data["rows"]:
+                return rows
 
     # ================= 1. SOATLIK VA KUNLIK SAVDO =================
-    async def get_hourly_sales(self, target_date: Optional[datetime.date] = None) -> Dict[str, Any]:
-        """Bugungi (yoki berilgan sanadagi) savdolarni soatma-soat hisoblaydi (Toshkent vaqti bilan +2 soat sinxron)"""
+    async def get_hourly_sales(self, target_date: Optional[date] = None, use_cache: bool = True) -> Dict[str, Any]:
+        """Berilgan kun (standart: bugun) savdolarini Toshkent vaqti bo'yicha 0..23 soat kesimida hisoblaydi.
+        Tushum = savdo − vozvrat (sof). MoySklad javob bermasa MoySkladError ko'taradi — "0 so'm" deb noto'g'ri hisobot bermaslik uchun.
+        Gateway ishlatilmaydi: u faqat 9..23 soatni hisoblaydi va vozvratlarni ayirmaydi."""
         now = datetime.now(tz)
         if target_date is None:
             target_date = now.date()
 
         date_key = target_date.strftime('%Y-%m-%d')
-        now_ts = datetime.now().timestamp()
-        
-        # 1. In-memory cache tekshirish (30 soniya)
-        if hasattr(self, "_hourly_cache"):
-            cached = self._hourly_cache.get(date_key)
-            if cached and (now_ts - cached["time"] < 30):
-                return cached["data"]
-        else:
-            self._hourly_cache = {}
+        now_ts = time.time()
 
-        # 2. Central Gateway orqali tezkor olish
-        gw_params = {"target_date": date_key}
-        gw_data = await self._request_gateway("sales/hourly", params=gw_params)
-        if gw_data and isinstance(gw_data, dict) and not gw_data.get("error"):
-            self._hourly_cache[date_key] = {"time": now_ts, "data": gw_data}
-            return gw_data
-
-        start_uz = f"{target_date.strftime('%Y-%m-%d')} 00:00:00"
-        end_uz = f"{target_date.strftime('%Y-%m-%d')} 23:59:59"
+        cached = self._hourly_cache.get(date_key)
+        if use_cache and cached and (now_ts - cached["time"] < 30):
+            return cached["data"]
 
         # MoySklad Moskva vaqtida (UTC+3) ishlagani uchun, Toshkent (UTC+5) sanasini -2 soatga o'tkazamiz
-        start_msk = to_msk_filter_str(start_uz)
-        end_msk = to_msk_filter_str(end_uz)
+        start_msk = to_msk_filter_str(f"{date_key} 00:00:00")
+        end_msk = to_msk_filter_str(f"{date_key} 23:59:59")
+        params = {"filter": f"moment>={start_msk};moment<={end_msk};applicable=true"}
 
-        # Retail demands (chakana savdo cheklari) va Demands (ulgurji/otgruzka)
-        filter_str = f"moment>={start_msk};moment<={end_msk}"
-        
-        rd_task = self._request("GET", "entity/retaildemand", params={"filter": filter_str, "limit": 1000})
-        dem_task = self._request("GET", "entity/demand", params={"filter": filter_str, "limit": 1000})
-        
-        rd_data, dem_data = await asyncio.gather(rd_task, dem_task)
-        
-        all_sales = []
-        if rd_data and "rows" in rd_data:
-            all_sales.extend(rd_data["rows"])
-        if dem_data and "rows" in dem_data:
-            all_sales.extend(dem_data["rows"])
+        # Chakana cheklar, otgruzkalar va ularning vozvratlari
+        rd_rows, dem_rows, rret_rows, sret_rows = await asyncio.gather(
+            self._fetch_all_rows("entity/retaildemand", params),
+            self._fetch_all_rows("entity/demand", params),
+            self._fetch_all_rows("entity/retailsalesreturn", params),
+            self._fetch_all_rows("entity/salesreturn", params),
+        )
+        if rd_rows is None or dem_rows is None or rret_rows is None or sret_rows is None:
+            raise MoySkladError(f"{date_key} savdo ma'lumotlarini MoySkladdan olib bo'lmadi")
 
-        # Soatlar bo'yicha guruhlash (09:00 dan 23:00 gacha Toshkent vaqti bilan)
-        hourly_data = {hour: {"count": 0, "sum": 0.0} for hour in range(config.WORK_START_HOUR, config.WORK_END_HOUR + 1)}
-        total_sum = 0.0
-        total_count = len(all_sales)
+        hourly_data = {
+            hour: {"count": 0, "sum": 0.0, "return_count": 0, "return_sum": 0.0}
+            for hour in range(24)
+        }
+        gross_sum = 0.0
+        return_sum = 0.0
 
-        for sale in all_sales:
-            moment_str = sale.get("moment", "")
-            sale_sum = (sale.get("sum", 0) or 0) / 100.0  # MoySklad tiyinda beradi
-            total_sum += sale_sum
+        def hour_of(doc: dict) -> Optional[int]:
+            dt_uz = to_tashkent_dt(doc.get("moment", ""))
+            return dt_uz.hour if dt_uz else None
 
-            if moment_str:
-                try:
-                    # MoySklad Moskva vaqtini Toshkent vaqtiga (+2 soat) o'tkazamiz
-                    dt_uz = to_tashkent_dt(moment_str)
-                    if dt_uz:
-                        hour = dt_uz.hour
-                        if hour in hourly_data:
-                            hourly_data[hour]["count"] += 1
-                            hourly_data[hour]["sum"] += sale_sum
-                except Exception:
-                    pass
+        for sale in rd_rows + dem_rows:
+            s = (sale.get("sum", 0) or 0) / 100.0  # MoySklad tiyinda beradi
+            gross_sum += s
+            h = hour_of(sale)
+            if h is not None:
+                hourly_data[h]["count"] += 1
+                hourly_data[h]["sum"] += s
 
-        avg_check = (total_sum / total_count) if total_count > 0 else 0.0
+        for ret in rret_rows + sret_rows:
+            s = (ret.get("sum", 0) or 0) / 100.0
+            return_sum += s
+            h = hour_of(ret)
+            if h is not None:
+                hourly_data[h]["return_count"] += 1
+                hourly_data[h]["return_sum"] += s
 
+        total_count = len(rd_rows) + len(dem_rows)
         res = {
             "date": target_date.strftime("%d.%m.%Y"),
-            "current_hour": now.hour,
-            "total_sum": total_sum,
+            "current_hour": now.hour if target_date == now.date() else 23,
+            "gross_sum": gross_sum,
+            "return_sum": return_sum,
+            "return_count": len(rret_rows) + len(sret_rows),
+            "total_sum": gross_sum - return_sum,  # sof tushum
             "total_count": total_count,
-            "avg_check": avg_check,
+            "avg_check": (gross_sum / total_count) if total_count > 0 else 0.0,
             "hourly": hourly_data
         }
         self._hourly_cache[date_key] = {"time": now_ts, "data": res}
