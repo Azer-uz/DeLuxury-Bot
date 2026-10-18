@@ -4,6 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 import config
 from scheduler import setup_scheduler
+from receipt_watcher import ReceiptWatcher
 
 # Handlerlarni import qilish
 from handlers import common, sales, stocks, supplies, finance, ai_chat
@@ -31,7 +32,10 @@ async def main():
     # Schedulerni ishga tushiramiz
     scheduler = setup_scheduler(bot)
     scheduler.start()
-    logger.info("⏱ Avtomatik soatlik scheduler ishga tushirildi.")
+    logger.info("📅 Kun yakuni scheduler ishga tushirildi.")
+
+    # Har bir chek yaratilgan zahoti Telegram'ga
+    watcher_task = asyncio.create_task(ReceiptWatcher(bot).run())
 
     # Super Adminlarga bot ishga tushgani haqida xabar yuborish
     for admin_id in config.SUPER_ADMIN_IDS:
@@ -50,6 +54,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        watcher_task.cancel()
         await bot.session.close()
 
 if __name__ == "__main__":

@@ -12,8 +12,6 @@ from moysklad_api import ms_api
 tz = pytz.timezone(config.TIMEZONE)
 logger = logging.getLogger(__name__)
 
-# Kassadan MoySkladga chek kechikib tushishi mumkin — hisobotni soat boshidan 2 daqiqa keyin olamiz
-HOURLY_REPORT_MINUTE = 2
 # Kun yakuni (kechagi kun) hisoboti vaqti
 DAILY_REPORT_HOUR = 0
 DAILY_REPORT_MINUTE = 5
@@ -57,54 +55,6 @@ async def broadcast(bot: Bot, text: str, recipients: set):
 
 def all_recipients() -> set:
     return config.SUPER_ADMIN_IDS | config.MANAGER_IDS
-
-async def send_hourly_report(bot: Bot):
-    """Har soatda o'tgan soat savdosini yuboradi.
-    Ish vaqtida (09:00–23:00) — har doim; ish vaqtidan tashqarida — faqat savdo yoki vozvrat bo'lsa."""
-    now = datetime.now(tz)
-    period_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
-    hour = period_start.hour
-    in_work_hours = is_work_hour(hour)
-
-    # 00:02 dagi hisobot 23:00–00:00 ni, ya'ni kechagi kunni yopadi
-    sales = await fetch_sales(period_start.date())
-    if sales is None:
-        if in_work_hours:
-            await broadcast(
-                bot,
-                f"⚠️ <b>Soatlik hisobot ({hour_range(hour)}) shakllanmadi</b>\n"
-                f"MoySklad javob bermadi. Ma'lumotlar keyingi hisobotda jami summaga qo'shiladi.",
-                config.SUPER_ADMIN_IDS,
-            )
-        return
-
-    h = sales["hourly"][hour]
-    if not in_work_hours and h["count"] == 0 and h["return_count"] == 0:
-        return
-
-    title = (
-        "⏱ <b>DE LUXURY — SOATLIK SAVDO AVTO-HISOBOTI</b>"
-        if in_work_hours else
-        "🌙 <b>DE LUXURY — ISH VAQTIDAN TASHQARI SAVDO</b>"
-    )
-    lines = [
-        title,
-        f"🕒 Vaqt: <b>{hour_range(hour)}</b>",
-        f"📅 Sana: <b>{sales['date']}</b>\n",
-        f"▫️ <b>O'tgan soatdagi savdo:</b> <code>{format_sum(h['sum'])} so'm</code> ({h['count']} ta chek)",
-    ]
-    if h["return_count"]:
-        lines.append(f"↩️ <b>Vozvrat:</b> <code>-{format_sum(h['return_sum'])} so'm</code> ({h['return_count']} ta)")
-    lines.extend([
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 <b>Kun boshidan buyon SOF TUSHUM:</b> <code>{format_sum(sales['total_sum'])} so'm</code>",
-        f"🧾 <b>Jami cheklar:</b> {sales['total_count']} ta",
-    ])
-    if sales["return_count"]:
-        lines.append(f"↩️ <b>Jami vozvrat:</b> {format_sum(sales['return_sum'])} so'm ({sales['return_count']} ta)")
-    lines.append(f"📊 <b>O'rtacha chek:</b> {format_sum(sales['avg_check'])} so'm")
-
-    await broadcast(bot, "\n".join(lines), all_recipients())
 
 async def send_daily_summary(bot: Bot):
     """Kechagi kun yakuni: sof tushum, vozvratlar, soatlar kesimi, kecha va o'tgan hafta bilan solishtirish"""
@@ -178,19 +128,13 @@ async def send_daily_summary(bot: Bot):
     await broadcast(bot, "\n".join(lines), all_recipients())
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
+    """Faqat kun yakuni hisoboti (00:05). Soatlik avto-hisobot olib tashlandi — har bir chek alohida
+    yuboriladi (receipt_watcher.py), soatlik kesim esa «⏱ Soatlik Savdo» tugmasi bilan olinadi."""
     scheduler = AsyncIOScheduler(timezone=tz)
-    job_opts = {"args": [bot], "replace_existing": True, "misfire_grace_time": 600, "coalesce": True, "max_instances": 1}
-    # Har soatning 2-daqiqasida, 24 soat davomida (ish vaqtidan tashqarida faqat savdo bo'lsa yuboriladi)
-    scheduler.add_job(
-        send_hourly_report,
-        CronTrigger(minute=HOURLY_REPORT_MINUTE, timezone=tz),
-        id="hourly_sales_job",
-        **job_opts,
-    )
     scheduler.add_job(
         send_daily_summary,
         CronTrigger(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, timezone=tz),
         id="daily_summary_job",
-        **job_opts,
+        args=[bot], replace_existing=True, misfire_grace_time=600, coalesce=True, max_instances=1,
     )
     return scheduler

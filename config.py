@@ -26,6 +26,8 @@ MANAGER_IDS = parse_id_list(os.getenv("MANAGER_IDS", "137334013"))
 TIMEZONE = "Asia/Tashkent"
 WORK_START_HOUR = 9   # 09:00
 WORK_END_HOUR = 23    # 23:00
+# Yangi cheklarni MoySklad'dan tekshirish oralig'i (soniya)
+RECEIPT_POLL_SECONDS = 15
 
 # MoySklad API Base
 MOYSKLAD_API_URL = "https://api.moysklad.ru/api/remap/1.2"

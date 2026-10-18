@@ -6,11 +6,12 @@ Ushbu loyiha **"DE LUXURY"** erkaklar kiyim do'koni uchun yaratilgan maxsus bosh
 
 ## 🚀 Asosiy Imkoniyatlar
 
-1. **⏱ Soatlik Savdo Monitoringi (24/7):**
-   - Har soatning 2-daqiqasida o'tgan soatdagi savdo, vozvrat, cheklar soni, o'rtacha chek va kunlik SOF tushumni (savdo − vozvrat) yuboradi.
-   - Ish vaqtida (09:00–23:00) hisobot har doim keladi; ish vaqtidan tashqarida — faqat savdo bo'lsa («🌙 Ish vaqtidan tashqari savdo»).
+1. **🧾 Har bir chek — darhol Telegram'ga:**
+   - MoySklad'da chek (chakana/ulgurji savdo, vozvrat) o'tkazilgan zahoti (~15 soniya ichida) pozitsiyalari, chegirma, naqd/karta/QR to'lovi va kun boshidan buyon jami bilan yuboriladi.
+   - Har bir hujjat faqat bir marta keladi (bot qayta ishga tushganda ham).
+   - Soatlar kesimi avtomatik yuborilmaydi — «⏱ Soatlik Savdo (Bugun)» tugmasi bilan olinadi.
    - Har kuni 00:05 da **Kun yakuni** hisoboti: soatlar kesimi, eng yaxshi soat, oldingi kun va o'tgan hafta bilan solishtirish.
-   - MoySklad javob bermasa, "0 so'm" o'rniga rahbarga ogohlantirish yuboriladi.
+   - MoySklad 5 daqiqa javob bermasa, rahbarga ogohlantirish yuboriladi.
 2. **📦 Tovar Kirimlari (Priyomka) & Yetkazib Beruvchilar:**
    - Kontragentlar (*Karvon, Turkiya Istanbul, Xitoy Abu Saxiy va h.k.*) yoki sanalar bo'yicha kirim hujjatlarini ko'rish.
    - Har bir kontragent bo'yicha tovar kodi, nomi, guruhi, kategoriyasi, vid tovari va narxlari aks etgan batafsil **Excel (.xlsx)** hisobotini yuklab berish.
